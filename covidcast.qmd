@@ -1,0 +1,605 @@
+---
+title: "Predicting COVID Outcomes using CTIS"
+subtitle: "CTIS: COVID Trends & Impact Survey"
+author: "Rao Abdul Hannan"
+format:
+  html:
+    colorlinks: true
+    number-sections: false
+    indent: true
+    toc: false
+    geometry: "letterpaper, top=1in, bottom=1in, left=1in, right=1in"
+    fontsize: 12pt
+    fig-align: center
+execute:
+  echo: false
+---
+```{r}
+suppressMessages({
+  suppressWarnings({
+    library(tidyverse)
+    library(patchwork)
+    library(boot)
+    library(GGally)
+    library(gt)
+    library(scales)
+    library(ggdag)
+    library(glmnet)
+  })
+})
+```
+
+```{r}
+covid <- read.csv("covidcast-hew-617.csv")
+covid_filtered <- na.omit(covid)
+```
+
+# Exploratory Data Analysis
+
+We use the `covid.csv` dataset for this report which has been compiled by the U.S. Department of Health, Education and Welfare (HEW), and contains variables that capture COVID activity, schooling, vaccination, behavior and beliefs, aggregated on the county level. Focusing on the first problem, we use the following response variable:
+
+-   `cli`: estimated percentage of people with COVID-Like illness, defined as experiencing cough, shortness of breath, or difficulty breathing. `tested_positive_14d` and `confirmed_7dav_incidence_prop` might seem more intuitive given the first problem however, the former depends on testing facilities which are not readily available throughout each county whereas the latter only captures information about new weekly cases in a county instead of the full severity of COVID activity. The distributions of `cli` and $\sqrt{\text{cli}}$ are displayed in Figure 1. The original variable shows slight skeweness to the right, motivating us to apply the square root transformation to make the distribution more normal-like as depicted by the red density curves. It is also easily noticeable some missing bars in both histograms; these represent rows in our dataset which had 'NA' values for other variables and therefore we exclude them from our analysis.
+
+```{r, fig.width=10, fig.height=4}
+cli_hist <- covid_filtered |>
+  ggplot(aes(x = cli/100)) +
+  geom_histogram(color = "gray10", fill = "steelblue",
+                 aes(y = after_stat(density))) +
+  geom_density(color = "tomato", linewidth = 0.8) +
+  scale_x_continuous(labels = label_percent()) +
+  labs(x = "CLI", y = "Count",
+       title = expression("Distribution of CLI")) +
+  theme_light() +
+  theme(axis.title = element_text(size = 10, hjust = 0.5),
+        plot.title = element_text(size = 12, hjust = 0.5))
+
+sqrtcli_hist <- covid_filtered |>
+  ggplot(aes(x = sqrt(cli))) +
+  geom_histogram(color = "gray10", fill = "steelblue",
+                 aes(y = after_stat(density))) +
+  geom_density(color = "tomato", linewidth = 0.8) +
+  labs(x = expression(sqrt("CLI")), y = "Count",
+       title = expression("Distribution of " * sqrt("CLI"))) +
+  theme_light() +
+  theme(axis.title = element_text(size = 10, hjust = 0.5),
+        plot.title = element_text(size = 12, hjust = 0.5))
+
+suppressMessages({
+    print((cli_hist + sqrtcli_hist) +
+    plot_annotation(title = expression(bold("Figure 1")),
+                  tag_levels = "A") &
+    theme(plot.title = element_text(size = 20, hjust = 0.5)))
+})
+```
+
+The primary covariates of concern for the first problem are `inperson_school_fulltime` and `inperson_school_parttime`. Figure 2 shows the distributions of these two variables against the response, which do not point towards strong associations however, we use regression later in the report to answer this question statistically. The plots show no evident signs of non-linear relationships between the covariates and response, and hence we assume the relationship is linear.
+\bigspace
+```{r}
+covid_filtered |>
+  dplyr::select(inperson_school_fulltime, inperson_school_parttime, cli) |>
+  ggpairs(progress = FALSE,
+          upper = list(continuous = wrap("cor", color = "steelblue3")),
+          lower = list(continuous = wrap("points", alpha = 0.7, color = "steelblue3")),
+          diag = list(continuous = wrap("densityDiag", color = "steelblue3"))) +
+  theme_light() +
+  labs(title = expression(bold("Figure 2") * ": CLI vs Schooling Status")) +
+  theme(plot.title = element_text(size = 12, hjust = 0.5))
+```
+
+Apart from the two primary covariates, there are three other variables that show a strong association with `cli`, namely `covid_vaccinated_or_accept`, `wearing_mask`, and `large_event_1d`. Figure 3 shows these associations along with correlation values. 
+\bigspace
+```{r, fig.height=4, fig.width=8}
+covid_filtered |>
+  dplyr::select(covid_vaccinated_or_accept, wearing_mask, large_event_1d, cli) |>
+  ggpairs(progress = FALSE,
+          upper = list(continuous = wrap("cor", color = "steelblue3")),
+          lower = list(continuous = wrap("points", alpha = 0.7, color = "steelblue3")),
+          diag = list(continuous = wrap("densityDiag", color = "steelblue3"))) +
+  theme_light() +
+  labs(title = expression(bold("Figure 3") * ": CLI vs Vaccination & Behavioral Variables")) +
+  theme(plot.title = element_text(size = 14, hjust = 0.5))
+```
+\newpage
+Moving on to the second problem for which our response variable is:
+
+-   `covid_vaccinated_or_accept`:  estimated percentage of respondents who either have already received a COVID vaccine or have an appointment to get a COVID vaccine or would definitely or probably choose to get vaccinated, if a vaccine were offered to them today. We choose this variable over `covid_vaccinated` since it also accounts for people who have already booked a vaccination appointment or would do so when they get the opportunity. This is important because during the time period the data was collected, COVID vaccines were not readily available so there was a considerable part of the public that wanted to get a vaccination but was merely waiting for it to be available. The distribution, displayed in Figure 4, is fairly normal and we decide not to use any transformations on it
+
+```{r}
+covid_train <- covid |>
+  filter(time_value == "2021-01-30") |>
+  dplyr::select(8, 23, 10:21) |>
+  na.omit()
+
+
+covid_vacc_hist <- covid_train |>
+  ggplot(aes(x = covid_vaccinated_or_accept/100)) +
+  geom_histogram(color = "gray10", fill = "steelblue",
+                 aes(y = after_stat(density))) +
+  geom_density(color = "tomato", linewidth = 0.8) +
+  scale_x_continuous(labels = label_percent()) +
+  labs(x = "People Vaccinated or have an Appointment", y = "Count",
+       title = expression(bold("Figure 4") * ": Distribution of COVID Vaccinated/Accept")) +
+  theme_light() +
+  theme(axis.title = element_text(size = 10, hjust = 0.5),
+        plot.title = element_text(size = 12, hjust = 0.5))
+
+suppressMessages({
+  print(covid_vacc_hist)
+})
+```
+Since the second problem requires a prediction be made using behavior and beliefs, we use all 13 variables in the data set belonging to these two categories.
+\newpage
+
+# Methods
+
+For the first problem, we transformed our response variable to stabilize the variance however, we perform regression using the Weight Least Squares (WLS) method to ensure that our model is robust. We start by first fitting an Ordinary Least Squares (OLS) regression represented by $\text{Eq}\; (1)$:
+
+\begin{align}
+\begin{split}
+E(\sqrt{cli}) &= {\beta}_0 + {\beta}_1inperson\_school\_fulltime + {\beta}_2inperson\_school\_parttime  \\
+&+ {\beta}_3covid\_vaccinated\_or\_accept + {\beta}_4wearing\_mask + {\beta}_5large\_event\_1d
+\end{split}
+\end{align}
+
+```{r}
+olsmodel <- lm(sqrt(cli) ~ inperson_school_fulltime + inperson_school_parttime + covid_vaccinated_or_accept + wearing_mask + large_event_1d,
+                data = covid_filtered)
+```
+
+We use the fitted values obtained from the OLS model as weights and use them for the weighted regression. Keeping in view our end goal is to quantify the effect of schooling variables on `cli`, we conduct the following test when fitting the regression model:
+
+$$H_0:\quad \beta_1 = \beta_2 = 0$$
+
+$$H_A:\quad \beta_1 \neq 0 \quad \text{or} \quad \beta_2 \neq 0$$
+
+Under the null hypotheses $H_0$, the coefficients of both the schooling variables $\beta_1$ and $\beta_2$ are $0$ i.e. in-person schooling does not have any effect on `cli`. We will reject the null if we get a $p-value \leq \alpha = 0.05$ which is our significance level. The results of our regression are summarized in Table 1.
+\bigspace
+```{r}
+wlsmodel <- lm(sqrt(cli) ~ inperson_school_fulltime + inperson_school_parttime + covid_vaccinated_or_accept + wearing_mask + large_event_1d,
+                data = covid_filtered, weights = 1/olsmodel$fitted.values)
+```
+
+```{r}
+coef_wlsmodel <- as.data.frame(summary(wlsmodel)$coefficients) |>
+  rownames_to_column(var = "Term") |>
+  rename(
+    Estimate = Estimate,
+    StdError = `Std. Error`,
+    tValue = `t value`,
+    pValue = `Pr(>|t|)`
+  )
+
+rse <- summary(wlsmodel)$sigma
+df <- summary(wlsmodel)$df[2]
+r_squared <- summary(wlsmodel)$r.squared
+adj_r_squared <- summary(wlsmodel)$adj.r.squared
+f_statistic <- summary(wlsmodel)$fstatistic[1]
+
+summary_stats <- data.frame(
+  Term = c("Residual Standard Error", "Deg of Freedom", "Multiple R-squared", 
+           "Adjusted R-squared", "F-statistic"),
+  Estimate = c(rse, df, r_squared, adj_r_squared, f_statistic),
+  StdError = c(NA, NA, NA, NA, NA),
+  tValue = c(NA, NA, NA, NA, NA),
+  pValue = c(NA, NA, NA, NA, NA)
+)
+
+clean_var_name <- function(x) {
+  case_when(
+    # Statistical terms
+    x == "(Intercept)" ~ "Intercept",
+    x == "Residual Standard Error" ~ "Residual Standard Error",
+    x == "Deg of Freedom" ~ "Degrees of Freedom",
+    x == "Multiple R-squared" ~ "Multiple R²",
+    x == "Adjusted R-squared" ~ "Adjusted R²",
+    x == "F-statistic" ~ "F-statistic",
+    # Variable names
+    str_detect(x, "cli") ~ "CLI",
+    str_detect(x, "1d") ~ str_replace(str_replace_all(x, "_", " ") |> str_to_title(), "1d", " (Last Day)"),
+    TRUE ~ str_replace_all(x, "_", " ") |> str_to_title()
+  )
+}
+
+combined_summary <- bind_rows(coef_wlsmodel, summary_stats) |>
+  mutate(Term = clean_var_name(Term))
+
+wls_table <- combined_summary |>
+  gt() |>
+  tab_header(
+    title = md("**Table 1**: WLS Regression Results")
+  ) |>
+  fmt_number(
+    columns = c(Estimate, StdError, tValue, pValue),
+    decimals = 3
+  ) |>
+  fmt("pValue",
+      fns = function(x) format.pval(x, digits = 3, epa = 0.001)) |>
+  cols_label(
+    Term = "Variable",
+    Estimate = "Estimate",
+    StdError = "Std Error",  # shortened
+    tValue = "t-value",
+    pValue = "p-value"
+  ) |>
+  cols_width(
+    Term ~ px(180),         # reduced from 220
+    Estimate ~ px(70),      # specific widths for each column
+    StdError ~ px(70),
+    tValue ~ px(70),
+    pValue ~ px(70)
+  ) |>
+  tab_options(
+    heading.background.color = "steelblue",
+    column_labels.background.color = "tomato",
+    table.font.size = px(12),  # smaller font
+    table.border.top.style = "solid",
+    table.border.bottom.style = "solid"
+  )
+wls_table
+```
+
+
+To evaluate the goodness-of-fit of our model, we use the diagnostic plots displayed in Figure 5.
+
+```{r, fig.height=10, fig.width=8}
+y = sqrt(covid_filtered$cli)
+y_hat = fitted(wlsmodel)
+std_residuals <- rstandard(wlsmodel)
+stud_residuals <- rstudent(wlsmodel)
+plot_data <- data.frame(
+  sqrt_cli = y,
+  fitted_values = y_hat,
+  std_res = std_residuals,
+  stu_res = stud_residuals,
+  sqrt_std_res = sqrt(abs(std_residuals))
+)
+
+plot1 <- plot_data |>
+  ggplot(aes(x = y_hat, y = sqrt_cli)) +
+  geom_point(shape = 1, color = "steelblue") +
+  theme_light() +
+  labs(x = "Observed Values", y = "Fitted Values",
+       title = "Fitted vs Observed Values") +
+  theme(plot.title = element_text(size = 12, hjust = 0.5))
+
+plot2 <- plot_data |>
+  ggplot(aes(x = y_hat, y = std_res)) +
+  geom_point(shape = 1, color = "steelblue") +
+  geom_hline(yintercept = c(-2, 0, 2), linetype = "dashed", color = "tomato") +
+  theme_light() +
+  labs(x = "Fitted Values", y = "Standardized Residuals",
+       title = "Standardized Residuals vs Fitted Values") +
+  theme(plot.title = element_text(size = 12, hjust = 0.5))
+
+
+plot3 <- plot_data |>
+  ggplot(aes(x = y_hat, y = sqrt_std_res)) +
+  geom_point(shape = 1, color = "steelblue") +
+  theme_light() +
+  labs(x = "Fitted Values", y = expression(sqrt("Standardized Residuals")),
+       title = expression(sqrt("Standardized Residuals") * " vs Fitted Values")) +
+  theme(plot.title = element_text(size = 12, hjust = 0.5))
+
+
+plot4 <- plot_data |>
+  ggplot(aes(x = y_hat, y = stu_res)) +
+  geom_point(shape = 1, color = "steelblue") +
+  geom_hline(yintercept = c(-3.3, 0, 3.3), linetype = "dashed", color = "tomato") +
+  theme_light() +
+  labs(x = "Fitted Values", y = "Studentized Residuals",
+       title = "Studentized Residuals vs Fitted Values") +
+  theme(plot.title = element_text(size = 12, hjust = 0.5))
+
+
+n = 104
+alpha = 0.05
+
+my_envelope <- function(n, alpha, conf = 1-(alpha/n)) {
+  normal <- qnorm((1 + conf) / 2)
+  se <- normal * sqrt(1/n + (n-1:n)^2 / (n*(n-1)^2))
+  ci_lower <- -se
+  ci_upper <- se
+  data.frame(ci_lower = ci_lower, ci_upper = ci_upper)
+}
+
+my_qqplot <- function(model) {
+  std_res <- rstandard(model)
+  n <- length(std_res)
+  alpha = 0.05
+  qq_data <- qqnorm(std_res, plot.it = FALSE)
+  envelope <- my_envelope(n, alpha)
+  plot_data <- data.frame(
+    theoretical_quantiles = qq_data$x,
+    observed_quantiles = qq_data$y,
+    lower = qq_data$x + envelope$ci_lower,
+    upper = qq_data$x + envelope$ci_upper
+  )
+  plot_data |>
+  ggplot(aes(x = theoretical_quantiles, y = observed_quantiles)) +
+    geom_point(shape = 1, color = "steelblue") +
+    geom_abline(intercept = 0, slope = 1, color = "tomato") +
+    geom_ribbon(aes(ymin = lower, ymax = upper),
+                fill = "gray", alpha = 0.5) +
+    labs(x = "Theoretical Quantiles", y = "Standardized Residuals",
+         title = "Q-Q Plot") +
+    theme_light() +
+  theme(plot.title = element_text(size = 12, hjust = 0.5))
+}
+
+plot5 <- my_qqplot(wlsmodel)
+
+# plot5 <- plot_data |>
+#   ggplot(aes(sample = std_res)) +
+#   stat_qq(color = "steelblue3", shape = 1) +
+#   stat_qq_line(color = "tomato") +
+#   theme_light() +
+#   labs(x = "Theoretical Quantiles", y = "Standarized Residuals")
+
+
+wlsmodel_resiuals <- rstandard(wlsmodel)
+leverage <- hatvalues(wlsmodel)
+cooks_distance <- cooks.distance(wlsmodel)
+model_data <- data.frame(
+  index = seq_along(wlsmodel_resiuals),
+  resids = wlsmodel_resiuals,
+  leverage = leverage,
+  cooks_distance = cooks_distance,
+  high_cook = cooks_distance > 1)
+
+plot6 <- model_data |>
+  ggplot(aes(x = index, y = cooks_distance)) +
+  geom_point(shape = 1, color = "steelblue") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "tomato") +
+  labs(x = "Index", y = "Cook's Distance",
+       title = "Cook's Distance") +
+  theme_light() +
+  theme(legend.title = element_text(hjust = 0.5)) +
+  theme(plot.title = element_text(size = 12, hjust = 0.5))
+
+
+plot7 <- suppressMessages({
+  model_data |>
+  ggplot(aes(x = leverage, y = resids)) +
+  geom_point(shape = 1, color = "steelblue") +
+  geom_smooth(method = "loess", color = "tomato", se = FALSE, span = 1) +
+  labs(x = "Leverage", y = "Standardized Residuals",
+       title = "Standardized Residuals vs Leverage") +
+  theme_light() +
+  theme(plot.title = element_text(size = 12, hjust = 0.5))
+})
+
+
+
+suppressMessages({
+  combined_plot <- (plot1 + plot2) / (plot3 + plot4) / (plot5 + plot6) / (plot7 + plot_spacer()) +
+  plot_annotation(title = expression(bold("Figure 5") * ": Diagnostic Plots"),
+                  tag_levels = "A") &
+    theme(plot.title = element_text(size = 13, hjust = 0.5))
+  print(combined_plot)
+})
+```
+
+For the second problem, we split the data into two sets based on the period it was collected in. We use the data from the first period to find the optimal value of the tuning parameter $\lambda$ using $k=10$-fold cross validation. This optimal value gives us the model with the lowest test mean squared error (MSE), as displayed by the red dot on the bottom left of Figure 6.
+
+```{r}
+period1 <- covid |>
+  filter(time_value == "2021-01-30") |>
+  dplyr::select(8, 23, 10:21) |>
+  na.omit()
+
+period2 <- covid |>
+  filter(time_value != "2021-01-30") |>
+  dplyr::select(23, 10:21) |>
+  na.omit()
+```
+
+```{r}
+#| warning: false
+#| message: false
+set.seed(1)
+predictors <- c("worried_become_ill",
+                "vaccine_likely_friends",
+                "vaccine_likely_who",
+                "vaccine_likely_govt_health",
+                "vaccine_likely_politicians",
+                "wearing_mask",
+                "others_masked",
+                "public_transit_1d",
+                "work_outside_home_1d",
+                "shop_1d",
+                "restaurant_1d",
+                "spent_time_1d",
+                "large_event_1d")
+
+X_train <- model.matrix(~ ., period1[, predictors])[,-1]
+y_train <- period1$covid_vaccinated_or_accept
+
+cv_lasso <- cv.glmnet(X_train, y_train, alpha = 1)
+
+best_lambda <- cv_lasso$lambda.min
+```
+
+```{r}
+suppressWarnings({
+print(data.frame(lambda = cv_lasso$lambda, mse = cv_lasso$cvm) |>
+  mutate(min_lam = as.numeric(min(lambda) == lambda)) |>
+  ggplot(aes(x = lambda, y = mse)) +
+  geom_line(color = "lightsteelblue2") +
+  geom_point(size = 1.5, aes(color = as.factor(min_lam))) +
+  scale_x_continuous() +
+  scale_color_manual(values = c("steelblue", "tomato")) +
+  labs(x = expression(lambda), y = "MSE",
+       title = expression(bold("Figure 6") * paste(": MSE vs ", lambda))) +
+  theme_light() +
+  theme(plot.title = element_text(size = 12, hjust = 0.5),
+        axis.title = element_text(size = 10, hjust = 0.5),
+        legend.position = "none") +
+  annotate("segment", x = 0, xend = 0,
+           y = 18, yend = 23, color = "gray10",
+           arrow = arrow(type = "closed", length = unit(0.1, "inches"))) +
+  annotate("text", x = 0, y = 25,
+           label = expression(lambda * "= 0.139"),
+           size = 5, color = "gray10", hjust = 0.2))
+})
+```
+
+A lasso model is then used to predict the values of `covid_vaccinated_or_accept` in the second period using the optimal value of $\lambda$. We prefer the lasso over ridge regression because it forces the coefficients of the potentially unimportant covariates to $0$ thereby doing both model and variable selection for us. The results of the lasso model are summarized in Table 2.
+\bigspace
+```{r}
+set.seed(1)
+lasso_model <- glmnet(X_train, y_train, alpha = 1, lambda = best_lambda)
+X_test <- model.matrix(~ ., period2[, predictors])[,-1]
+predictions <- predict(lasso_model, newx = X_test)
+period2$predicted_vax_accept <- predictions
+
+min_mse <- min(cv_lasso$cvm)
+min_mse_se <- cv_lasso$cvsd[which.min(cv_lasso$cvm)]
+rmse <- sqrt(min_mse)
+```
+
+```{r}
+coef_matrix <- as.matrix(coef(lasso_model))
+nonzero_coefs <- coef_matrix[coef_matrix != 0, , drop = FALSE]
+
+results_df <- data.frame(
+  Variable = rownames(nonzero_coefs),
+  Coefficient = nonzero_coefs[,1]
+)
+
+clean_var_name <- function(x) {
+  x <- case_when(
+    x == "(Intercept)" ~ "Intercept",
+    TRUE ~ x
+  )
+  x <- str_replace_all(x, "_", " ")
+  x <- str_to_title(x)
+  x <- case_when(
+    str_detect(x, "1d") ~ str_replace(x, "1d", " (Last Day)"),
+    str_detect(x, "Govt") ~ str_replace(x, "Govt", "Government"),
+    str_detect(x, "Who") ~ str_replace(x, "Who", "WHO"),
+    TRUE ~ x
+  )
+  return(x)
+}
+
+n_rows <- ceiling(nrow(results_df) / 2)
+results_wide <- data.frame(
+  Variable1 = clean_var_name(results_df$Variable[1:n_rows]),
+  Coefficient1 = results_df$Coefficient[1:n_rows],
+  Variable2 = clean_var_name(results_df$Variable[(n_rows + 1):nrow(results_df)]),
+  Coefficient2 = results_df$Coefficient[(n_rows + 1):nrow(results_df)]
+)
+
+lasso_table <- results_wide |>
+  gt() |>
+  tab_header(
+    title = md("**Table 2**: LASSO Regression Results"),
+    subtitle = "Predictors of COVID-19 Vaccination Acceptance"
+  ) |>
+  fmt_number(
+    columns = c(Coefficient1, Coefficient2),
+    decimals = 4
+  ) |>
+  cols_label(
+    Variable1 = "Predictor",
+    Coefficient1 = "Coefficient",
+    Variable2 = "Predictor",
+    Coefficient2 = "Coefficient"
+  ) |>
+  tab_source_note(
+    source_note = md(sprintf(
+      "Performance Metrics: RMSE: %.3f, MSE: %.3f (SE: %.3f), Best λ: %.3f",
+      rmse, min_mse, min_mse_se, best_lambda
+    ))
+  ) |>
+  tab_style(
+    style = list(
+      cell_text(weight = "bold")
+    ),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(
+    style = list(
+      cell_borders(
+        sides = "right",
+        color = "gray10",
+        weight = px(1)
+    )),
+    locations = cells_body(
+      columns = Coefficient1
+    )
+  ) |>
+  tab_style(
+    style = list(
+      cell_text(size = px(14))
+    ),
+    locations = cells_title("title")
+  ) |>
+  tab_style(
+    style = list(
+      cell_text(size = px(12))
+    ),
+    locations = cells_title("subtitle")
+  ) |>
+  cols_width(
+    Variable1 ~ px(200),
+    Coefficient1 ~ px(100),
+    Variable2 ~ px(200),
+    Coefficient2 ~ px(100)
+  ) |>
+  opt_table_font(
+    font = "Arial"
+  ) |>
+  tab_options(
+    heading.background.color = "steelblue",
+    column_labels.background.color = "tomato",
+    table.border.top.style = "solid",
+    table.border.bottom.style = "solid",
+    table.font.size = px(16)
+  )
+
+lasso_table
+```
+\newpage
+
+# Discussion and Results
+
+Before discussing our findings in detail, it is pertinent to highlight that the results of this study must be implemented keeping in mind that they were obtained using survey data, which is prone to both:
+
+-   Response Bias: indicating that certain types of people are more likely to respond than others, people may answer what they think is socially acceptable, and people may have inaccurate memory of past events
+
+and
+
+-   Sampling Bias: indicating that the survey does not reach the entire target population, there may be systematic differences between respondents and non-respondents, and our sample may not be representative of the entire population
+
+## Problem 1
+
+The results summarized in Table 1 show that the $p-values$ associated with the coefficients of the two schooling covariates of concern `inperson_school_fulltime` and `inperson_school_parttime` are $>\;0.05$ which means we fail to reject the null hypothesis $H_0$ under the $5\%$ significance level and conclude that in-person schooling does not have a statistically significant relationship with $\sqrt{\text{cli}}$ and hence `cli`. The validity of our model is supported by the diagnostic plots displayed in Figure 5. Plot D shows all studentized residuals behaving within the limits shown by the dotted red lines. Similarly, the Q-Q plot displayed in Plot E shows all residuals are within the confidence band, a strong sign of normality, except a single point which can be attributed to randomness. Plot F proves that all points have low Cook's distance values indicating there are no high-leverage points present in our data.
+
+**Given these results, our conclusion is that there is no meaningful relationship between in-person schooling and COVID health outcomes.**
+
+## Problem 2
+
+Table 2 summarizes the values of the coefficients for all predictors whereby we can use $\text{Eq} \; (2)$ to predict the values of `covid_vaccinated_or_accept`, abbreviated as $Y$, for the second period:
+
+\begin{align}
+\begin{split}
+E(Y) &= \beta_0 + \beta_1vaccine\_likely\_friends + \beta_2vaccine\_likely\_who  \\
+&+ \beta_3vaccine\_likely\_govt\_health + \beta_4vaccine\_likely\_politicians \\
+&+ \beta_5wearing\_mask + \beta_6others\_masked + \beta_7public\_transit\_1d \\
+&+ \beta_8work\_outside\_home\_1d + \beta_9large\_event\_1d
+\end{split}
+\end{align}
+
+As mentioned previously in the Methods section, the lasso method forces some coefficients to be zero and that is exactly what our model has done to the the coefficients of `worried_become_ill`, `shop_1d`, `restaurant_1d`, and `spent_time_1d`; the reason why there coefficients are not mentioned in Table 2. The model performance metrics, listed in the footnotes of Table 2 measure the accuracy of our model. Our estimate of the test MSE is $15.812 \pm 1.519$ at the $95\%$ confidence level, and when square rooted, gives us the root MSE (RMSE) in the interval $(3.57, 4.28)$. This RMSE is in the same units as our response variable and therefore more interpretable, implying that our prediction of `covid_vaccinated_or_accept` for the second period deviates from the actual value somewhere between $3.57$ to $4.28$ units (where a single unit is 1%). 
+
+**Our results are promising and statistically verified result, and we recommend using $\text{Eq}\; (2)$ for predicting vaccine uptake in people provided their behavior and beliefs are known.**
+
+
+
+
+
+
+
+
+
